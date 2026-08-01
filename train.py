@@ -20,6 +20,8 @@ Example
 from __future__ import annotations
 
 import argparse
+import csv
+import json
 from pathlib import Path
 
 import numpy as np
@@ -127,6 +129,105 @@ def evaluate_denormalized(model, loader, device, num_targets):
     return (sums / counts.clamp_min(1)).cpu().tolist()
 
 
+@torch.no_grad()
+def evaluate_node_averaged_mae(model, loader, device, num_targets):
+    """Node-averaged MAE in physical units, averaged across all valid node-feature entries.
+
+    This matches the common PowerGraph-style reporting where the per-quantity
+    MAE is computed over the node-level predictions after masking invalid
+    entries.
+    """
+    model.eval()
+    sums = torch.zeros(num_targets, device=device)
+    counts = torch.zeros(num_targets, device=device)
+    for batch in loader:
+        batch = batch.to(device)
+        pred = model(batch.x, batch.edge_index, batch.edge_attr, batch.batch)
+        maxs_per_node = batch.maxs[batch.batch]
+        pred_phys = pred * maxs_per_node
+        target_phys = batch.y * maxs_per_node
+        mask = batch.mask.float()
+        abs_err = (pred_phys - target_phys).abs() * mask
+        sums += abs_err.sum(dim=0)
+        counts += mask.sum(dim=0)
+    return (sums / counts.clamp_min(1)).cpu().tolist()
+
+
+@torch.no_grad()
+def evaluate_node_averaged_mse(model, loader, device, num_targets):
+    """Node-averaged MSE in physical units, averaged across all valid node-feature entries."""
+    model.eval()
+    sums = torch.zeros(num_targets, device=device)
+    counts = torch.zeros(num_targets, device=device)
+    for batch in loader:
+        batch = batch.to(device)
+        pred = model(batch.x, batch.edge_index, batch.edge_attr, batch.batch)
+        maxs_per_node = batch.maxs[batch.batch]
+        pred_phys = pred * maxs_per_node
+        target_phys = batch.y * maxs_per_node
+        mask = batch.mask.float()
+        sq_err = ((pred_phys - target_phys) ** 2) * mask
+        sums += sq_err.sum(dim=0)
+        counts += mask.sum(dim=0)
+    return (sums / counts.clamp_min(1)).cpu().tolist()
+
+
+@torch.no_grad()
+def collect_test_rows(model, loader, device, num_nodes, feature_names):
+    model.eval()
+    rows = []
+    graph_offset = 0
+    for batch in loader:
+        batch = batch.to(device)
+        pred = model(batch.x, batch.edge_index, batch.edge_attr, batch.batch)
+        maxs_per_node = batch.maxs[batch.batch]
+        pred_phys = pred * maxs_per_node
+        target_phys = batch.y * maxs_per_node
+        mask = batch.mask.float()
+
+        num_graphs = int(batch.batch.max().item()) + 1
+        node_ids = torch.arange(num_nodes, device=device).repeat(num_graphs)
+        graph_ids = torch.arange(graph_offset, graph_offset + num_graphs, device=device).repeat_interleave(num_nodes)
+        graph_offset += num_graphs
+
+        for idx in range(pred_phys.size(0)):
+            row = {
+                "graph_id": int(graph_ids[idx].item()),
+                "node_id": int(node_ids[idx].item()),
+            }
+            for target_idx, target_name in enumerate(feature_names):
+                target_value = float(target_phys[idx, target_idx].item())
+                pred_value = float(pred_phys[idx, target_idx].item())
+                row[f"{target_name}_target"] = target_value
+                row[f"{target_name}_pred"] = pred_value
+                row[f"{target_name}_abs_err"] = abs(pred_value - target_value)
+                row[f"{target_name}_mask"] = int(mask[idx, target_idx].item())
+            rows.append(row)
+    return rows
+
+
+def save_run_artifacts(results_dir, run_id, history_rows, summary, test_rows):
+    results_dir = Path(results_dir)
+    results_dir.mkdir(parents=True, exist_ok=True)
+
+    history_path = results_dir / f"{run_id}_history.csv"
+    with history_path.open("w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=list(history_rows[0].keys()) if history_rows else ["epoch"])
+        writer.writeheader()
+        writer.writerows(history_rows)
+
+    summary_path = results_dir / f"{run_id}_summary.json"
+    with summary_path.open("w") as f:
+        json.dump(summary, f, indent=2)
+
+    if test_rows:
+        test_path = results_dir / f"{run_id}_test_predictions.csv"
+        with test_path.open("w", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=list(test_rows[0].keys()))
+            writer.writeheader()
+            writer.writerows(test_rows)
+
+
 def main():
     parser = argparse.ArgumentParser(description="Train Graph Transformer for PF/OPF regression")
     parser.add_argument("--data_dir", type=str, required=True, help="processed data dir from preprocessing.py")
@@ -193,12 +294,22 @@ def main():
     best_val_loss = float("inf")
     best_val_r2 = float("-inf")
     epochs_no_improve = 0
+    history_rows = []
 
     for epoch in range(1, args.epochs + 1):
         train_loss = train_one_epoch(model, train_loader, optimizer, device)
         if paper_mode:
             val_loss, val_r2 = evaluate(model, val_loader, device, paper_mode=True)
             scheduler.step(val_loss)
+            history_rows.append({
+                "epoch": epoch,
+                "train_loss": train_loss,
+                "val_loss": val_loss,
+                "val_r2": val_r2,
+                "lr": optimizer.param_groups[0]["lr"],
+                "best_val_loss": best_val_loss if best_val_loss != float("inf") else val_loss,
+                "best_val_r2": best_val_r2 if best_val_r2 != float("-inf") else val_r2,
+            })
 
             print(
                 f"Epoch:{epoch}, Training_loss:{train_loss:.4f}, Eval_loss:{val_loss:.6f}, "
@@ -223,6 +334,15 @@ def main():
         else:
             val_loss = evaluate(model, val_loader, device)
             scheduler.step(val_loss)
+            history_rows.append({
+                "epoch": epoch,
+                "train_loss": train_loss,
+                "val_loss": val_loss,
+                "val_r2": None,
+                "lr": optimizer.param_groups[0]["lr"],
+                "best_val_loss": best_val_loss if best_val_loss != float("inf") else val_loss,
+                "best_val_r2": None,
+            })
 
             print(f"Epoch {epoch:03d} | train_loss(masked MSE, norm) {train_loss:.6f} | "
                   f"val_loss(masked MSE, norm) {val_loss:.6f}")
@@ -245,15 +365,63 @@ def main():
         print(f"\nBest val_loss (masked MSE, normalized): {best_val_loss:.6f}")
         print(f"Test  loss (masked MSE, normalized): {test_loss:.6f}")
         print(f"Test  r2score: {test_r2:.6f}")
+        node_mse = evaluate_node_averaged_mse(model, test_loader, device, meta["num_targets"])
+        node_mae = evaluate_node_averaged_mae(model, test_loader, device, meta["num_targets"])
+        print("Node-averaged Mean Squared Errors on the predicted physical quantities:")
+        for name, val in zip(meta["y_feature_names"], node_mse):
+            print(f"  {name:>10s}: MSE = {val:.6f}")
+        print("Node-averaged Mean Absolute Errors on the predicted physical quantities:")
+        for name, val in zip(meta["y_feature_names"], node_mae):
+            print(f"  {name:>10s}: MAE = {val:.6f}")
+        test_rows = collect_test_rows(model, test_loader, device, meta["num_nodes"], meta["y_feature_names"])
+        summary = {
+            "backend": args.backend,
+            "model_variant": args.model_variant,
+            "hidden_dim": args.hidden_dim,
+            "num_layers": args.num_layers,
+            "num_heads": args.num_heads,
+            "seed": args.seed,
+            "best_val_loss": best_val_loss,
+            "test_loss": test_loss,
+            "test_r2": test_r2,
+            "node_averaged_mse": {name: val for name, val in zip(meta["y_feature_names"], node_mse)},
+            "node_averaged_mae": {name: val for name, val in zip(meta["y_feature_names"], node_mae)},
+            "train_frac": 0.85,
+            "val_frac": 0.05,
+            "test_frac": 0.10,
+        }
     else:
         test_loss = evaluate(model, test_loader, device)
         print(f"\nBest val_loss (masked MSE, normalized): {best_val_loss:.6f}")
         print(f"Test  loss (masked MSE, normalized): {test_loss:.6f}")
 
-        denorm_mae = evaluate_denormalized(model, test_loader, device, meta["num_targets"])
-        print("Test MAE in physical units (masked, de-normalized via max-abs scaling):")
-        for name, val in zip(meta["y_feature_names"], denorm_mae):
+        node_mse = evaluate_node_averaged_mse(model, test_loader, device, meta["num_targets"])
+        node_mae = evaluate_node_averaged_mae(model, test_loader, device, meta["num_targets"])
+        print("Node-averaged Mean Squared Errors on the predicted physical quantities:")
+        for name, val in zip(meta["y_feature_names"], node_mse):
+            print(f"  {name:>10s}: MSE = {val:.6f}")
+        print("Node-averaged Mean Absolute Errors on the predicted physical quantities:")
+        for name, val in zip(meta["y_feature_names"], node_mae):
             print(f"  {name:>10s}: MAE = {val:.6f}")
+        test_rows = collect_test_rows(model, test_loader, device, meta["num_nodes"], meta["y_feature_names"])
+        summary = {
+            "backend": args.backend,
+            "model_variant": args.model_variant,
+            "hidden_dim": args.hidden_dim,
+            "num_layers": args.num_layers,
+            "num_heads": args.num_heads,
+            "seed": args.seed,
+            "best_val_loss": best_val_loss,
+            "test_loss": test_loss,
+            "node_averaged_mse": {name: val for name, val in zip(meta["y_feature_names"], node_mse)},
+            "node_averaged_mae": {name: val for name, val in zip(meta["y_feature_names"], node_mae)},
+            "train_frac": 0.85,
+            "val_frac": 0.05,
+            "test_frac": 0.10,
+        }
+
+    run_id = f"{args.backend}_{args.model_variant}_h{args.hidden_dim}_l{args.num_layers}_heads{args.num_heads}_seed{args.seed}"
+    save_run_artifacts(Path(args.out).parent / "results", run_id, history_rows, summary, test_rows)
 
 
 if __name__ == "__main__":
