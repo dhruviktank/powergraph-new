@@ -1,0 +1,6 @@
+numpy>=1.23
+scipy>=1.9
+mat73>=0.60        # needed to load X.mat / Y_polar.mat cell arrays (v7.3)
+h5py>=3.7          # mat73's backend; also used as a fallback in mat_io.py
+torch>=2.0
+torch_geometric>=2.3
