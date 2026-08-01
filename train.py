@@ -50,10 +50,22 @@ def masked_mae_sum(pred, target, mask):
     return err.sum(dim=0), mask.sum(dim=0).clamp_min(1)
 
 
+def r2_from_tensors(target, pred):
+    target = target.reshape(-1).float()
+    pred = pred.reshape(-1).float()
+    target_mean = target.mean()
+    ss_res = torch.sum((target - pred) ** 2)
+    ss_tot = torch.sum((target - target_mean) ** 2)
+    if ss_tot.item() == 0:
+        return 0.0
+    return (1.0 - ss_res / ss_tot).item()
+
+
 @torch.no_grad()
-def evaluate(model, loader, device):
+def evaluate(model, loader, device, paper_mode: bool = False):
     model.eval()
     total_sq, total_count = 0.0, 0.0
+    r2_scores = []
     for batch in loader:
         batch = batch.to(device)
         pred = model(batch.x, batch.edge_index, batch.edge_attr, batch.batch)
@@ -61,7 +73,15 @@ def evaluate(model, loader, device):
         diff2 = ((pred - batch.y) ** 2) * mask
         total_sq += diff2.sum().item()
         total_count += mask.sum().item()
+        if paper_mode:
+            pred_eval = pred.detach().clone()
+            target_eval = batch.y.detach().clone()
+            pred_eval[mask == 0] = 1e-7
+            target_eval[mask == 0] = 1e-7
+            r2_scores.append(r2_from_tensors(target_eval.cpu(), pred_eval.cpu()))
     mse = total_sq / max(total_count, 1)
+    if paper_mode:
+        return mse, float(np.mean(r2_scores)) if r2_scores else float("nan")
     return mse
 
 
@@ -122,7 +142,8 @@ def main():
     parser.add_argument("--weight_decay", type=float, default=0.0)
     parser.add_argument("--batch_size", type=int, default=32)
     parser.add_argument("--epochs", type=int, default=50)
-    parser.add_argument("--patience", type=int, default=15, help="early stopping patience")
+    parser.add_argument("--patience", type=int, default=10, help="early stopping patience")
+    parser.add_argument("--num_early_stop", type=int, default=10, help="paper-style early stopping patience")
     parser.add_argument("--out", type=str, default="checkpoints/best_model.pt")
     parser.add_argument("--seed", type=int, default=0)
     args = parser.parse_args()
@@ -154,44 +175,85 @@ def main():
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"Model: {args.backend}/{args.model_variant} | Params: {n_params:,}")
 
-    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="min", factor=0.5, patience=5)
+    paper_mode = args.model_variant == "paper"
+    if paper_mode:
+        optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer, mode="min", factor=0.1, patience=10
+        )
+    else:
+        optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer, mode="min", factor=0.5, patience=5
+        )
 
     out_path = Path(args.out)
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
     best_val_loss = float("inf")
+    best_val_r2 = float("-inf")
     epochs_no_improve = 0
 
     for epoch in range(1, args.epochs + 1):
         train_loss = train_one_epoch(model, train_loader, optimizer, device)
-        val_loss = evaluate(model, val_loader, device)
-        scheduler.step(val_loss)
+        if paper_mode:
+            val_loss, val_r2 = evaluate(model, val_loader, device, paper_mode=True)
+            scheduler.step(val_loss)
 
-        print(f"Epoch {epoch:03d} | train_loss(masked MSE, norm) {train_loss:.6f} | "
-              f"val_loss(masked MSE, norm) {val_loss:.6f}")
+            print(
+                f"Epoch:{epoch}, Training_loss:{train_loss:.4f}, Eval_loss:{val_loss:.6f}, "
+                f"Eval_r2:{val_r2:.6f}, lr:{optimizer.param_groups[0]['lr']}"
+            )
 
-        if val_loss < best_val_loss:
-            best_val_loss = val_loss
-            epochs_no_improve = 0
-            torch.save({"model_state_dict": model.state_dict(), "args": vars(args)}, out_path)
-        else:
-            epochs_no_improve += 1
-            if epochs_no_improve >= args.patience:
-                print(f"Early stopping at epoch {epoch} (no improvement for {args.patience} epochs)")
+            if val_loss <= best_val_loss:
+                best_val_loss = val_loss
+                epochs_no_improve = 0
+            else:
+                epochs_no_improve += 1
+
+            if val_r2 > best_val_r2:
+                best_val_r2 = val_r2
+                torch.save({"model_state_dict": model.state_dict(), "args": vars(args)}, out_path)
+
+            if epoch > args.epochs / 2 and epochs_no_improve > args.num_early_stop:
+                print(
+                    f"Early stopping at epoch {epoch} (no improvement for {args.num_early_stop} epochs)"
+                )
                 break
+        else:
+            val_loss = evaluate(model, val_loader, device)
+            scheduler.step(val_loss)
+
+            print(f"Epoch {epoch:03d} | train_loss(masked MSE, norm) {train_loss:.6f} | "
+                  f"val_loss(masked MSE, norm) {val_loss:.6f}")
+
+            if val_loss < best_val_loss:
+                best_val_loss = val_loss
+                epochs_no_improve = 0
+                torch.save({"model_state_dict": model.state_dict(), "args": vars(args)}, out_path)
+            else:
+                epochs_no_improve += 1
+                if epochs_no_improve >= args.patience:
+                    print(f"Early stopping at epoch {epoch} (no improvement for {args.patience} epochs)")
+                    break
 
     # final test evaluation using the best checkpoint
     ckpt = torch.load(out_path, map_location=device, weights_only=False)
     model.load_state_dict(ckpt["model_state_dict"])
-    test_loss = evaluate(model, test_loader, device)
-    print(f"\nBest val_loss (masked MSE, normalized): {best_val_loss:.6f}")
-    print(f"Test  loss (masked MSE, normalized): {test_loss:.6f}")
+    if paper_mode:
+        test_loss, test_r2 = evaluate(model, test_loader, device, paper_mode=True)
+        print(f"\nBest val_loss (masked MSE, normalized): {best_val_loss:.6f}")
+        print(f"Test  loss (masked MSE, normalized): {test_loss:.6f}")
+        print(f"Test  r2score: {test_r2:.6f}")
+    else:
+        test_loss = evaluate(model, test_loader, device)
+        print(f"\nBest val_loss (masked MSE, normalized): {best_val_loss:.6f}")
+        print(f"Test  loss (masked MSE, normalized): {test_loss:.6f}")
 
-    denorm_mae = evaluate_denormalized(model, test_loader, device, meta["num_targets"])
-    print("Test MAE in physical units (masked, de-normalized via max-abs scaling):")
-    for name, val in zip(meta["y_feature_names"], denorm_mae):
-        print(f"  {name:>10s}: MAE = {val:.6f}")
+        denorm_mae = evaluate_denormalized(model, test_loader, device, meta["num_targets"])
+        print("Test MAE in physical units (masked, de-normalized via max-abs scaling):")
+        for name, val in zip(meta["y_feature_names"], denorm_mae):
+            print(f"  {name:>10s}: MAE = {val:.6f}")
 
 
 if __name__ == "__main__":
