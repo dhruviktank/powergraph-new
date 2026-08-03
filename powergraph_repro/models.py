@@ -104,7 +104,7 @@ class GraphTransformerRegressor(nn.Module):
         hidden_dim: int = 128,
         num_layers: int = 3,
         heads: int = 4,
-        dropout: float = 0.0,
+        dropout: float = 0.1,
         activation: str = "relu",
         norm_type: str = "none",
         attention_dropout: float = 0.0,

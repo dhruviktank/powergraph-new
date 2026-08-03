@@ -270,11 +270,11 @@ def run_experiment(cfg: TrainConfig) -> RunResult:
         )
 
         print(
-            f"Epoch:{epoch}, Training_loss:{train_loss:.4f}, Eval_loss:{val_loss:.6f}, Eval_r2:{val_r2:.6f}, lr:{current_lr}"
+            f"Epoch:{epoch}, Training_loss:{train_loss:.8f}, Eval_loss:{val_loss:.8f}, Eval_r2:{val_r2:.8f}, lr:{current_lr:.8g}"
         )
         if current_lr < previous_lr:
             print(
-                f"  ReduceLROnPlateau lowered lr from {previous_lr:.6g} to {current_lr:.6g} because val_loss stopped improving"
+                f"  ReduceLROnPlateau lowered lr from {previous_lr:.8g} to {current_lr:.8g} because val_loss stopped improving"
             )
 
         if val_loss <= best_val_loss:
@@ -343,15 +343,15 @@ def run_experiment(cfg: TrainConfig) -> RunResult:
         ],
     )
 
-    print(f"\nBest val_loss (masked MSE, normalized): {best_val_loss:.6f}")
-    print(f"Test  loss (masked MSE, normalized): {test_loss:.6f}")
-    print(f"Test  r2score: {test_r2:.6f}")
+    print(f"\nBest val_loss (masked MSE, normalized): {best_val_loss:.8f}")
+    print(f"Test  loss (masked MSE, normalized): {test_loss:.8f}")
+    print(f"Test  r2score: {test_r2:.8f}")
     print("Node-averaged Mean Squared Errors on the predicted physical quantities:")
     for name, value in node_mse.items():
-        print(f"  {name:>10s}: MSE = {value:.6f}")
+        print(f"  {name:>10s}: MSE = {value:.8f}")
     print("Node-averaged Mean Absolute Errors on the predicted physical quantities:")
     for name, value in node_mae.items():
-        print(f"  {name:>10s}: MAE = {value:.6f}")
+        print(f"  {name:>10s}: MAE = {value:.8f}")
 
     return RunResult(
         config=asdict(cfg),
