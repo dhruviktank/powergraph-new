@@ -113,7 +113,7 @@ def build_powergraph_bundle(
     train_frac: float = 0.85,
     val_frac: float = 0.05,
     test_frac: float = 0.10,
-    seed: int = 0,
+    seed: int = 2,
     fit_on_train_only: bool = False,
     symmetrize_edges: bool = False,
 ) -> PowerGraphBundle:
@@ -164,13 +164,14 @@ def build_powergraph_bundle(
     num_node_features = full_x[0].shape[-1]
     num_targets = full_y[0].shape[-1]
 
-    # generator = torch.Generator().manual_seed(seed)
-    # permutation = torch.randperm(num_scenarios, generator=generator).tolist()
-
-    permutation = torch.arange(num_scenarios).tolist()
+    # Generate a reproducible random permutation
+    generator = torch.Generator()
+    generator.manual_seed(seed)
+    permutation = torch.randperm(num_scenarios, generator=generator).tolist()
 
     num_train = int(train_frac * num_scenarios)
     num_val = int(val_frac * num_scenarios)
+    # num_test = num_scenarios - num_train - num_val
     train_idx = permutation[:num_train]
     val_idx = permutation[num_train:num_train + num_val]
     test_idx = permutation[num_train + num_val:]
