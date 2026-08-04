@@ -168,6 +168,69 @@ class GraphTransformerRegressor(nn.Module):
             h = self.act(h)
         return self.readout(h)
 
+class GraphTransformerOriginal(nn.Module):
+    def __init__(
+        self,
+        num_node_features: int,
+        num_edge_features: int,
+        num_targets: int,
+        hidden_dim: int = 128,
+        num_layers: int = 3,
+        heads: int = 4,
+        dropout: float = 0.1,
+    ):
+        super().__init__()
+
+        self.convs = nn.ModuleList()
+
+        current_dim = num_node_features
+        for _ in range(num_layers):
+            self.convs.append(
+                TransformerConv(
+                    in_channels=current_dim,
+                    out_channels=hidden_dim,
+                    heads=heads,
+                    concat=False,
+                    edge_dim=num_edge_features,
+                )
+            )
+            current_dim = hidden_dim
+
+        self.dropout = dropout
+
+        # Same prediction head as original GNN_basic
+        self.readout = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, num_targets),
+        )
+
+    def forward(
+        self,
+        x,
+        edge_index,
+        edge_attr,
+        edge_weight=None,
+        batch=None,
+    ):
+        # Original implementation multiplies edge attributes by edge weights
+        if edge_weight is not None:
+            edge_attr = edge_attr * edge_weight[:, None]
+
+        for conv in self.convs:
+            x = conv(
+                x,
+                edge_index,
+                edge_attr=edge_attr,
+            )
+            x = F.relu(x)
+            x = F.dropout(
+                x,
+                p=self.dropout,
+                training=self.training,
+            )
+
+        return self.readout(x)
 
 @dataclass
 class ModelConfig:
@@ -221,5 +284,15 @@ def build_model(**kwargs) -> nn.Module:
             residual=config.residual,
             layer_norm=config.layer_norm,
             concat_heads=config.concat_heads,
+        )
+    if model_name in {"transformer_original", "original_transformer"}:
+        return GraphTransformerOriginal(
+            num_node_features=config.num_node_features,
+            num_edge_features=config.num_edge_features,
+            num_targets=config.num_targets,
+            hidden_dim=config.hidden_dim,
+            num_layers=config.num_layers,
+            heads=config.heads,
+            dropout=config.dropout,
         )
     raise ValueError("model_name must be 'gat' or 'transformer'")
