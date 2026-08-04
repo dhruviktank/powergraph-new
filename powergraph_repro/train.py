@@ -371,7 +371,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--data_dir", type=str, required=True)
     parser.add_argument("--processed_dir", type=str, default="processed_powergraph")
     parser.add_argument("--results_dir", type=str, default="results")
-    parser.add_argument("--model_name", type=str, default="transformer", choices=["gat", "transformer"])
+    parser.add_argument("--model_name", type=str, default="transformer", choices=["gat", "transformer", "original_transformer"])
     parser.add_argument("--problem", type=str, default="pf", choices=["pf", "opf"])
     parser.add_argument("--hidden_dim", type=int, default=32)
     parser.add_argument("--num_layers", type=int, default=3)
