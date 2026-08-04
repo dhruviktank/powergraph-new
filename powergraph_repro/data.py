@@ -164,8 +164,11 @@ def build_powergraph_bundle(
     num_node_features = full_x[0].shape[-1]
     num_targets = full_y[0].shape[-1]
 
-    generator = torch.Generator().manual_seed(seed)
-    permutation = torch.randperm(num_scenarios, generator=generator).tolist()
+    # generator = torch.Generator().manual_seed(seed)
+    # permutation = torch.randperm(num_scenarios, generator=generator).tolist()
+
+    permutation = torch.arange(num_scenarios).tolist()
+
     num_train = int(train_frac * num_scenarios)
     num_val = int(val_frac * num_scenarios)
     train_idx = permutation[:num_train]
